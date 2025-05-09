@@ -4,6 +4,11 @@ FROM mcr.microsoft.com/playwright:v1.44.0-jammy
 # Set working directory
 WORKDIR /app
 
+# Install Python 3.10 and dependencies
+RUN apt-get update && \
+    apt-get install -y python3.10 python3-pip python3.10-venv && \
+    ln -s /usr/bin/python3.10 /usr/bin/python
+
 # Copy project files
 COPY . .
 
