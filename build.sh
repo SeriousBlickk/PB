@@ -5,13 +5,12 @@ python -m pip install --upgrade pip
 pip install -r requirements.txt
 # Install Playwright
 pip install playwright
-# Add additional apt sources for newer packages
-apt-get update
-apt-get install -y software-properties-common
-add-apt-repository -y ppa:ubuntu-toolchain-r/test
-apt-get update
-# Install system dependencies for Playwright
-apt-get install -y \
+# Install system dependencies for Playwright with sudo
+sudo apt-get update
+sudo apt-get install -y software-properties-common
+sudo add-apt-repository -y ppa:ubuntu-toolchain-r/test
+sudo apt-get update
+sudo apt-get install -y \
   libglib2.0-0 \
   libnss3 \
   libnspr4 \
