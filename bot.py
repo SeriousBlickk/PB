@@ -31,7 +31,10 @@ def load_config():
         with open('config.json', 'r') as f:
             return json.load(f)
     except FileNotFoundError:
-        return {"stores": {}, "items": {}, "channel_id": None}
+        logger.warning("config.json not found, creating a new one.")
+        config = {"stores": {}, "items": {}, "channel_id": None}
+        save_config(config)
+        return config
 
 def save_config(config):
     with open('config.json', 'w') as f:
@@ -141,20 +144,32 @@ class StockBotView(View):
 
     @discord.ui.button(label="Check Stock Now", style=ButtonStyle.blurple)
     async def check_stock(self, interaction: discord.Interaction, button: Button):
+        logger.info("Check Stock Now button clicked.")
         # Defer immediately to avoid timeout
-        await interaction.response.defer(ephemeral=True)
-        
+        try:
+            await interaction.response.defer(ephemeral=True)
+            logger.info("Interaction deferred successfully.")
+        except Exception as e:
+            logger.error(f"Failed to defer interaction: {str(e)}")
+            return
+
         if not config['channel_id']:
+            logger.warning("No channel_id set in config.")
             await interaction.followup.send("Channel not set. Run `/setup` in #stock-alerts.", ephemeral=True)
             return
         channel = bot.get_channel(int(config['channel_id']))
         if not channel:
+            logger.warning("Channel not found for channel_id: {config['channel_id']}")
             await interaction.followup.send("Channel not found. Run `/setup` in #stock-alerts.", ephemeral=True)
             return
+
+        # Log config state
+        logger.info(f"Config items: {config['items']}")
 
         # Run stock check in background
         try:
             results = await check_all_stock(manual=True)
+            logger.info(f"Stock check completed with {len(results)} results.")
             if results:
                 for result in results:
                     await channel.send(embed=result)
@@ -178,252 +193,266 @@ USER_AGENTS = [
 
 # Stock checking logic with Playwright
 async def check_stock(url, store, retries=3):
-    async with async_playwright() as p:
-        # Configure proxy if provided
-        proxy = None
-        if PROXY_URL:
-            logger.info(f"Using proxy for {url}: {PROXY_URL}")
-            proxy = {"server": PROXY_URL}
+    logger.info(f"Starting stock check for {url}")
+    try:
+        async with async_playwright() as p:
+            # Configure proxy if provided
+            proxy = None
+            if PROXY_URL:
+                logger.info(f"Using proxy for {url}: {PROXY_URL}")
+                proxy = {"server": PROXY_URL}
 
-        browser = await p.chromium.launch(headless=True, proxy=proxy)
-        context = await browser.new_context(
-            user_agent=random.choice(USER_AGENTS),
-            viewport={"width": 1280, "height": 720},
-            extra_http_headers={
-                "Accept-Language": "en-GB,en-US;q=0.9",
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-                "Accept-Encoding": "gzip, deflate, br",
-                "Connection": "keep-alive",
-                "Upgrade-Insecure-Requests": "1",
-                "Sec-Fetch-Dest": "document",
-                "Sec-Fetch-Mode": "navigate",
-                "Sec-Fetch-Site": "none",
-                "Sec-Fetch-User": "?1"
-            },
-            java_script_enabled=True,
-            locale="en-GB",
-            geolocation={"latitude": 51.5074, "longitude": -0.1278},  # London coordinates
-            permissions=["geolocation"]
-        )
-        page = await context.new_page()
-        for attempt in range(retries):
-            try:
-                # Random delay to mimic human behavior
-                await asyncio.sleep(random.uniform(0.5, 2.0))
-
-                # Navigate with increased timeout and relaxed wait condition
+            browser = await p.chromium.launch(headless=True, proxy=proxy)
+            logger.info("Browser launched successfully.")
+            context = await browser.new_context(
+                user_agent=random.choice(USER_AGENTS),
+                viewport={"width": 1280, "height": 720},
+                extra_http_headers={
+                    "Accept-Language": "en-GB,en-US;q=0.9",
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+                    "Accept-Encoding": "gzip, deflate, br",
+                    "Connection": "keep-alive",
+                    "Upgrade-Insecure-Requests": "1",
+                    "Sec-Fetch-Dest": "document",
+                    "Sec-Fetch-Mode": "navigate",
+                    "Sec-Fetch-Site": "none",
+                    "Sec-Fetch-User": "?1"
+                },
+                java_script_enabled=True,
+                locale="en-GB",
+                geolocation={"latitude": 51.5074, "longitude": -0.1278},  # London coordinates
+                permissions=["geolocation"]
+            )
+            logger.info("Browser context created successfully.")
+            page = await context.new_page()
+            for attempt in range(retries):
                 try:
-                    await page.goto(url, timeout=60000, wait_until="domcontentloaded")
-                except PlaywrightError as e:
-                    if "Timeout" in str(e):
-                        logger.warning(f"Timeout on {url}, attempt {attempt + 1}. Falling back to partial load check.")
-                        # Fallback: Check if page loaded partially
-                        title = await page.title()
-                        if title:
-                            logger.info(f"Page partially loaded for {url}: Title = {title}")
+                    # Random delay to mimic human behavior
+                    await asyncio.sleep(random.uniform(0.5, 2.0))
+
+                    # Navigate with increased timeout and relaxed wait condition
+                    try:
+                        logger.info(f"Navigating to {url}, attempt {attempt + 1}")
+                        await page.goto(url, timeout=60000, wait_until="domcontentloaded")
+                    except PlaywrightError as e:
+                        if "Timeout" in str(e):
+                            logger.warning(f"Timeout on {url}, attempt {attempt + 1}. Falling back to partial load check.")
+                            # Fallback: Check if page loaded partially
+                            title = await page.title()
+                            if title:
+                                logger.info(f"Page partially loaded for {url}: Title = {title}")
+                            else:
+                                raise e  # Re-raise if no content loaded
+
+                    await page.wait_for_timeout(random.randint(3000, 5000))  # Wait for JS rendering
+
+                    # Log page content for debugging
+                    content = await page.content()
+                    logger.debug(f"Page content for {url}: {content[:1000]}...")
+
+                    # Check for CAPTCHA or bot detection
+                    captcha = await page.query_selector('text="Enter the characters you see below"') or \
+                              await page.query_selector('form[action*="/errors/validateCaptcha"]')
+                    if captcha:
+                        logger.warning(f"CAPTCHA detected on {url}, attempt {attempt + 1}")
+                        if attempt < retries - 1:
+                            await page.wait_for_timeout(random.randint(2000, 5000))
+                            continue
+                        await browser.close()
+                        return None, "Blocked by CAPTCHA", None, False
+
+                    title = await page.title()
+                    if "sorry" in title.lower() or "robot" in title.lower():
+                        logger.warning(f"Bot detection or redirect on {url}, attempt {attempt + 1}")
+                        if attempt < retries - 1:
+                            await page.wait_for_timeout(random.randint(2000, 5000))
+                            continue
+                        await browser.close()
+                        return None, "Bot detection or redirect", None, False
+
+                    # Check for 403 Forbidden (Pokémon Center)
+                    if "403" in title or "Forbidden" in title:
+                        logger.warning(f"403 Forbidden on {url}, attempt {attempt + 1}")
+                        if attempt < retries - 1:
+                            await page.wait_for_timeout(random.randint(2000, 5000))
+                            continue
+                        await browser.close()
+                        return None, "403 Forbidden", None, False
+
+                    # Define stock status terms
+                    in_stock_terms = [
+                        "in stock", "add to cart", "buy now",
+                        "get it by", "arrives before", "free delivery", "pre-order now",
+                        "ships from and sold by amazon.co.uk",
+                        "in stock on", "order now", "ready to ship",
+                        "only 1 left", "only 2 left", "only 3 left", "only 4 left", "only 5 left",
+                        "only 6 left", "only 7 left", "only 8 left", "only 9 left", "only 10 left",
+                        "only 11 left", "only 12 left", "only 13 left", "only 14 left", "only 15 left",
+                        "in stock soon", "arrives", "dispatched", "usually dispatched"
+                    ]
+                    low_stock_terms = [f"only {i} left in stock" for i in range(1, 16)]
+                    low_stock_terms.extend([f"only {i} left in stock (more on the way)" for i in range(1, 16)])
+                    in_stock_terms.extend(low_stock_terms)
+
+                    out_of_stock_terms = [
+                        "currently unavailable", "out of stock", "temporarily out of stock",
+                        "we don’t know when or if this item will be back in stock",
+                        "see all buying options", "unavailable",
+                        "this item cannot be dispatched to your selected delivery location"
+                    ]
+
+                    # Store-specific checks
+                    if store == "Pokemon Center UK":
+                        stock_element = await page.query_selector('button.add-to-cart')
+                        is_in_stock = bool(stock_element)
+                        reason = "Add to Cart button found" if is_in_stock else "No Add to Cart button"
+                        image_elem = await page.query_selector('img.product-image')
+                        image_url = await image_elem.get_attribute('src') if image_elem else None
+                        is_low_stock = False
+                    elif store == "Smyths Toys":
+                        stock_element = await page.query_selector('text=In Stock')
+                        is_in_stock = bool(stock_element)
+                        reason = "In Stock text found" if is_in_stock else "No In Stock text"
+                        image_elem = await page.query_selector('img[data-main-image]')
+                        image_url = await image_elem.get_attribute('src') if image_elem else None
+                        is_low_stock = False
+                    else:  # Amazon UK
+                        # Check multiple elements for stock status
+                        selectors = [
+                            "#availability",
+                            ".a-section.a-spacing-none.a-spacing-top-mini",
+                            "#availability_feature_div",
+                            ".a-size-medium.a-color-success",
+                            ".a-size-medium.a-color-price",
+                            "#availability span",
+                            "#availability_feature_div span"
+                        ]
+                        availability_text = ""
+                        for selector in selectors:
+                            element = await page.query_selector(selector)
+                            if element:
+                                text = await element.inner_text()
+                                if text:
+                                    availability_text = text.lower().strip()
+                                    logger.debug(f"Found availability text with selector {selector}: {availability_text}")
+                                    break
+
+                        # Check buttons
+                        add_to_cart = await page.query_selector("#add-to-cart-button") or \
+                                      await page.query_selector('input[title="Add to Basket"]')
+                        buy_now = await page.query_selector("#buy-now-button") or \
+                                  await page.query_selector('input[title="Buy Now"]')
+
+                        # Check delivery message
+                        delivery_selectors = [
+                            "#deliveryBlockMessage",
+                            ".a-section.a-spacing-mini",
+                            "#mir-layout-DELIVERY_BLOCK-slot-PRIMARY_DELIVERY_MESSAGE_LARGE",
+                            "#mir-layout-DELIVERY_BLOCK-slot-SECONDARY_DELIVERY_MESSAGE"
+                        ]
+                        delivery_text = ""
+                        for selector in delivery_selectors:
+                            element = await page.query_selector(selector)
+                            if element:
+                                text = await element.inner_text()
+                                if text:
+                                    delivery_text = text.lower().strip()
+                                    logger.debug(f"Found delivery text with selector {selector}: {delivery_text}")
+                                    break
+
+                        # Check seller
+                        seller_selectors = [
+                            "#merchant-info",
+                            "#sellerProfileTriggerId",
+                            "#bylineInfo",
+                            ".offer-display-feature-text-message"
+                        ]
+                        seller_text = ""
+                        for selector in seller_selectors:
+                            element = await page.query_selector(selector)
+                            if element:
+                                text = await element.inner_text()
+                                if text:
+                                    seller_text = text.lower().strip()
+                                    logger.debug(f"Found seller text with selector {selector}: {seller_text}")
+                                    break
+                        is_amazon_seller = "amazon" in seller_text or "ships from and sold by amazon.co.uk" in availability_text
+
+                        # Log for debugging
+                        logger.info(f"Checking {url}: availability='{availability_text}', delivery='{delivery_text}', add_to_cart={bool(add_to_cart)}, buy_now={bool(buy_now)}, seller_text='{seller_text}'")
+
+                        # Determine stock status
+                        is_in_stock = False
+                        is_low_stock = False
+                        reason = "Unknown"
+
+                        # Prioritize buttons as the most reliable indicator
+                        if add_to_cart or buy_now:
+                            is_in_stock = True
+                            reason = "Add to Cart or Buy Now button found"
+                        elif any(term in availability_text for term in out_of_stock_terms) or \
+                             any(term in delivery_text for term in out_of_stock_terms):
+                            is_in_stock = False
+                            reason = f"Out of stock text found: {availability_text[:50]}..."
+                        elif any(term in availability_text for term in in_stock_terms) or \
+                             any(term in delivery_text for term in in_stock_terms):
+                            is_in_stock = True
+                            reason = f"In stock text found: {availability_text[:50]}... (delivery: {delivery_text[:50]}...)"
                         else:
-                            raise e  # Re-raise if no content loaded
+                            is_in_stock = False
+                            reason = "No stock indicators found"
 
-                await page.wait_for_timeout(random.randint(3000, 5000))  # Wait for JS rendering
+                        # Check low stock
+                        if is_in_stock and any(term in availability_text for term in low_stock_terms):
+                            is_low_stock = True
+                            reason = f"Low stock: {availability_text[:50]}..."
 
-                # Log page content for debugging
-                content = await page.content()
-                logger.debug(f"Page content for {url}: {content[:1000]}...")
+                        # Get product image
+                        image_selectors = [
+                            "img#landingImage",
+                            ".a-dynamic-image",
+                            "img#main-image",
+                            ".imgTagWrapper img"
+                        ]
+                        image_url = None
+                        for selector in image_selectors:
+                            image_elem = await page.query_selector(selector)
+                            if image_elem:
+                                image_url = await image_elem.get_attribute("src")
+                                if image_url:
+                                    break
 
-                # Check for CAPTCHA or bot detection
-                captcha = await page.query_selector('text="Enter the characters you see below"') or \
-                          await page.query_selector('form[action*="/errors/validateCaptcha"]')
-                if captcha:
-                    logger.warning(f"CAPTCHA detected on {url}, attempt {attempt + 1}")
+                    await browser.close()
+                    logger.info(f"Stock check result for {url}: in_stock={is_in_stock}, low_stock={is_low_stock}, reason='{reason}'")
+                    return is_in_stock, reason, image_url, is_low_stock
+                except PlaywrightError as e:
+                    logger.warning(f"Attempt {attempt + 1} failed for {url}: {str(e)}")
                     if attempt < retries - 1:
                         await page.wait_for_timeout(random.randint(2000, 5000))
                         continue
                     await browser.close()
-                    return None, "Blocked by CAPTCHA", None, False
-
-                title = await page.title()
-                if "sorry" in title.lower() or "robot" in title.lower():
-                    logger.warning(f"Bot detection or redirect on {url}, attempt {attempt + 1}")
-                    if attempt < retries - 1:
-                        await page.wait_for_timeout(random.randint(2000, 5000))
-                        continue
+                    return None, f"Error after retries: {str(e)}", None, False
+                except Exception as e:
+                    logger.error(f"Unexpected error checking {url}: {str(e)}")
                     await browser.close()
-                    return None, "Bot detection or redirect", None, False
-
-                # Check for 403 Forbidden (Pokémon Center)
-                if "403" in title or "Forbidden" in title:
-                    logger.warning(f"403 Forbidden on {url}, attempt {attempt + 1}")
-                    if attempt < retries - 1:
-                        await page.wait_for_timeout(random.randint(2000, 5000))
-                        continue
-                    await browser.close()
-                    return None, "403 Forbidden", None, False
-
-                # Define stock status terms
-                in_stock_terms = [
-                    "in stock", "add to cart", "buy now",
-                    "get it by", "arrives before", "free delivery", "pre-order now",
-                    "ships from and sold by amazon.co.uk",
-                    "in stock on", "order now", "ready to ship",
-                    "only 1 left", "only 2 left", "only 3 left", "only 4 left", "only 5 left",
-                    "only 6 left", "only 7 left", "only 8 left", "only 9 left", "only 10 left",
-                    "only 11 left", "only 12 left", "only 13 left", "only 14 left", "only 15 left",
-                    "in stock soon", "arrives", "dispatched", "usually dispatched"
-                ]
-                low_stock_terms = [f"only {i} left in stock" for i in range(1, 16)]
-                low_stock_terms.extend([f"only {i} left in stock (more on the way)" for i in range(1, 16)])
-                in_stock_terms.extend(low_stock_terms)
-
-                out_of_stock_terms = [
-                    "currently unavailable", "out of stock", "temporarily out of stock",
-                    "we don’t know when or if this item will be back in stock",
-                    "see all buying options", "unavailable",
-                    "this item cannot be dispatched to your selected delivery location"
-                ]
-
-                # Store-specific checks
-                if store == "Pokemon Center UK":
-                    stock_element = await page.query_selector('button.add-to-cart')
-                    is_in_stock = bool(stock_element)
-                    reason = "Add to Cart button found" if is_in_stock else "No Add to Cart button"
-                    image_elem = await page.query_selector('img.product-image')
-                    image_url = await image_elem.get_attribute('src') if image_elem else None
-                    is_low_stock = False
-                elif store == "Smyths Toys":
-                    stock_element = await page.query_selector('text=In Stock')
-                    is_in_stock = bool(stock_element)
-                    reason = "In Stock text found" if is_in_stock else "No In Stock text"
-                    image_elem = await page.query_selector('img[data-main-image]')
-                    image_url = await image_elem.get_attribute('src') if image_elem else None
-                    is_low_stock = False
-                else:  # Amazon UK
-                    # Check multiple elements for stock status
-                    selectors = [
-                        "#availability",
-                        ".a-section.a-spacing-none.a-spacing-top-mini",
-                        "#availability_feature_div",
-                        ".a-size-medium.a-color-success",
-                        ".a-size-medium.a-color-price",
-                        "#availability span",
-                        "#availability_feature_div span"
-                    ]
-                    availability_text = ""
-                    for selector in selectors:
-                        element = await page.query_selector(selector)
-                        if element:
-                            text = await element.inner_text()
-                            if text:
-                                availability_text = text.lower().strip()
-                                logger.debug(f"Found availability text with selector {selector}: {availability_text}")
-                                break
-
-                    # Check buttons
-                    add_to_cart = await page.query_selector("#add-to-cart-button") or \
-                                  await page.query_selector('input[title="Add to Basket"]')
-                    buy_now = await page.query_selector("#buy-now-button") or \
-                              await page.query_selector('input[title="Buy Now"]')
-
-                    # Check delivery message
-                    delivery_selectors = [
-                        "#deliveryBlockMessage",
-                        ".a-section.a-spacing-mini",
-                        "#mir-layout-DELIVERY_BLOCK-slot-PRIMARY_DELIVERY_MESSAGE_LARGE",
-                        "#mir-layout-DELIVERY_BLOCK-slot-SECONDARY_DELIVERY_MESSAGE"
-                    ]
-                    delivery_text = ""
-                    for selector in delivery_selectors:
-                        element = await page.query_selector(selector)
-                        if element:
-                            text = await element.inner_text()
-                            if text:
-                                delivery_text = text.lower().strip()
-                                logger.debug(f"Found delivery text with selector {selector}: {delivery_text}")
-                                break
-
-                    # Check seller
-                    seller_selectors = [
-                        "#merchant-info",
-                        "#sellerProfileTriggerId",
-                        "#bylineInfo",
-                        ".offer-display-feature-text-message"
-                    ]
-                    seller_text = ""
-                    for selector in seller_selectors:
-                        element = await page.query_selector(selector)
-                        if element:
-                            text = await element.inner_text()
-                            if text:
-                                seller_text = text.lower().strip()
-                                logger.debug(f"Found seller text with selector {selector}: {seller_text}")
-                                break
-                    is_amazon_seller = "amazon" in seller_text or "ships from and sold by amazon.co.uk" in availability_text
-
-                    # Log for debugging
-                    logger.info(f"Checking {url}: availability='{availability_text}', delivery='{delivery_text}', add_to_cart={bool(add_to_cart)}, buy_now={bool(buy_now)}, seller_text='{seller_text}'")
-
-                    # Determine stock status
-                    is_in_stock = False
-                    is_low_stock = False
-                    reason = "Unknown"
-
-                    # Prioritize buttons as the most reliable indicator
-                    if add_to_cart or buy_now:
-                        is_in_stock = True
-                        reason = "Add to Cart or Buy Now button found"
-                    elif any(term in availability_text for term in out_of_stock_terms) or \
-                         any(term in delivery_text for term in out_of_stock_terms):
-                        is_in_stock = False
-                        reason = f"Out of stock text found: {availability_text[:50]}..."
-                    elif any(term in availability_text for term in in_stock_terms) or \
-                         any(term in delivery_text for term in in_stock_terms):
-                        is_in_stock = True
-                        reason = f"In stock text found: {availability_text[:50]}... (delivery: {delivery_text[:50]}...)"
-                    else:
-                        is_in_stock = False
-                        reason = "No stock indicators found"
-
-                    # Check low stock
-                    if is_in_stock and any(term in availability_text for term in low_stock_terms):
-                        is_low_stock = True
-                        reason = f"Low stock: {availability_text[:50]}..."
-
-                    # Get product image
-                    image_selectors = [
-                        "img#landingImage",
-                        ".a-dynamic-image",
-                        "img#main-image",
-                        ".imgTagWrapper img"
-                    ]
-                    image_url = None
-                    for selector in image_selectors:
-                        image_elem = await page.query_selector(selector)
-                        if image_elem:
-                            image_url = await image_elem.get_attribute("src")
-                            if image_url:
-                                break
-
-                await browser.close()
-                logger.info(f"Stock check result for {url}: in_stock={is_in_stock}, low_stock={is_low_stock}, reason='{reason}'")
-                return is_in_stock, reason, image_url, is_low_stock
-            except PlaywrightError as e:
-                logger.warning(f"Attempt {attempt + 1} failed for {url}: {str(e)}")
-                if attempt < retries - 1:
-                    await page.wait_for_timeout(random.randint(2000, 5000))
-                    continue
-                await browser.close()
-                return None, f"Error after retries: {str(e)}", None, False
-            except Exception as e:
-                logger.error(f"Unexpected error checking {url}: {str(e)}")
-                await browser.close()
-                return None, f"Unexpected error: {str(e)}", None, False
+                    return None, f"Unexpected error: {str(e)}", None, False
+    except Exception as e:
+        logger.error(f"Failed to initialize Playwright for {url}: {str(e)}")
+        return None, f"Playwright initialization failed: {str(e)}", None, False
 
 async def check_all_stock(manual=False):
+    logger.info("Starting check_all_stock")
+    if not config['items']:
+        logger.warning("No items configured to check.")
+        return []
+
     results = []
     for item_name, item_data in config['items'].items():
         url = item_data['url']
         store = item_data['store']
         last_status = item_data.get('last_status')
         last_low_stock = item_data.get('last_low_stock')
+        logger.info(f"Checking item: {item_name}, URL: {url}, Store: {store}")
         is_in_stock, reason, image_url, is_low_stock = await check_stock(url, store)
 
         # Skip if check failed (e.g., timeout, CAPTCHA)
@@ -453,11 +482,13 @@ async def check_all_stock(manual=False):
             config['items'][item_name]['last_low_stock'] = False
 
         save_config(config)
+    logger.info(f"check_all_stock completed with {len(results)} results")
     return results
 
 # Periodic stock checker
 @tasks.loop(seconds=60)
 async def stock_checker():
+    logger.info("Starting periodic stock checker")
     if not config['channel_id']:
         logger.warning("No channel_id set. Run `/setup` in #stock-alerts.")
         return
@@ -495,6 +526,7 @@ async def on_ready():
 
 @bot.command()
 async def setup(ctx):
+    logger.info(f"Running /setup in channel {ctx.channel.id}")
     config['channel_id'] = str(ctx.channel.id)
     save_config(config)
     view = StockBotView()
