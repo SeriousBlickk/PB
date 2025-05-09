@@ -20,6 +20,7 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 PORT = int(os.getenv("PORT", 8000))
+PROXY_URL = os.getenv("PROXY_URL")  # Optional: e.g., "http://username:password@proxy:port"
 
 # Bot setup with intents
 intents = discord.Intents.default()
@@ -166,44 +167,71 @@ class StockBotView(View):
             logger.error(f"Check stock failed: {str(e)}")
             await interaction.followup.send("Failed to check stock due to an error. Please try again later.", ephemeral=True)
 
-# Stock checking logic with aiohttp and BeautifulSoup
-async def check_stock(url, store, retries=2):
+# Expanded user-agent pool
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Safari/605.1.15",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/119.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Edge/120.0.0.0",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1",
+    "Mozilla/5.0 (Linux; Android 13; SM-G981B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
+]
+
+# Stock checking logic with improved anti-bot measures
+async def check_stock(url, store, retries=3):
     headers = {
-        "User-Agent": random.choice([
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Safari/605.1.15"
-        ]),
+        "User-Agent": random.choice(USER_AGENTS),
         "Accept-Language": "en-GB,en-US;q=0.9",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8"
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1"
     }
+
+    # Configure proxy if provided
+    proxy = PROXY_URL if PROXY_URL else None
+    if proxy:
+        logger.info(f"Using proxy for {url}: {proxy}")
 
     async with aiohttp.ClientSession() as session:
         for attempt in range(retries):
             try:
-                async with session.get(url, headers=headers, timeout=5) as response:
+                # Random delay to mimic human behavior
+                await asyncio.sleep(random.uniform(0.5, 2.0))
+
+                async with session.get(url, headers=headers, proxy=proxy, timeout=10) as response:
                     if response.status != 200:
                         logger.warning(f"Failed to fetch {url}, status {response.status}, attempt {attempt + 1}")
                         if attempt < retries - 1:
-                            await asyncio.sleep(random.randint(1, 3))
+                            await asyncio.sleep(random.randint(2, 5))
                             continue
                         return None, f"Failed to fetch page (status {response.status})", None, False
 
                     html = await response.text()
                     soup = BeautifulSoup(html, 'html.parser')
 
+                    # Log response headers for debugging
+                    logger.debug(f"Response headers for {url}: {dict(response.headers)}")
+
                     # Check for CAPTCHA or bot detection
-                    if soup.find(string=re.compile("Enter the characters you see below", re.I)) or \
-                       soup.find("form", action=re.compile(r"/errors/validateCaptcha", re.I)):
+                    captcha_text = soup.find(string=re.compile("Enter the characters you see below", re.I)) or \
+                                  soup.find("form", action=re.compile(r"/errors/validateCaptcha", re.I))
+                    if captcha_text:
                         logger.warning(f"CAPTCHA detected on {url}, attempt {attempt + 1}")
                         if attempt < retries - 1:
-                            await asyncio.sleep(random.randint(1, 3))
+                            await asyncio.sleep(random.randint(2, 5))
                             continue
                         return None, "Blocked by CAPTCHA", None, False
 
-                    if "sorry" in soup.title.get_text().lower() if soup.title else False:
+                    if soup.title and "sorry" in soup.title.get_text().lower():
                         logger.warning(f"Bot detection or redirect on {url}, attempt {attempt + 1}")
                         if attempt < retries - 1:
-                            await asyncio.sleep(random.randint(1, 3))
+                            await asyncio.sleep(random.randint(2, 5))
                             continue
                         return None, "Bot detection or redirect", None, False
 
@@ -230,7 +258,6 @@ async def check_stock(url, store, retries=2):
 
                     # Store-specific checks
                     if store == "Pokemon Center UK":
-                        # Simplified check (can revert to Playwright if needed)
                         add_to_cart = soup.find("button", class_="add-to-cart")
                         is_in_stock = bool(add_to_cart)
                         reason = "Add to Cart button found" if is_in_stock else "No Add to Cart button"
@@ -348,7 +375,7 @@ async def check_stock(url, store, retries=2):
             except Exception as e:
                 logger.warning(f"Attempt {attempt + 1} failed for {url}: {str(e)}")
                 if attempt < retries - 1:
-                    await asyncio.sleep(random.randint(1, 3))
+                    await asyncio.sleep(random.randint(2, 5))
                     continue
                 return None, f"Error after retries: {str(e)}", None, False
 
