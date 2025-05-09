@@ -191,7 +191,7 @@ USER_AGENTS = [
     "Mozilla/5.0 (Linux; Android 13; SM-G981B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
 ]
 
-# Stock checking logic with Playwright
+# Updated stock checking logic with Playwright
 async def check_stock(url, store, retries=3):
     logger.info(f"Starting stock check for {url}")
     try:
@@ -225,6 +225,7 @@ async def check_stock(url, store, retries=3):
             )
             logger.info("Browser context created successfully.")
             page = await context.new_page()
+
             for attempt in range(retries):
                 try:
                     # Random delay to mimic human behavior
@@ -279,152 +280,19 @@ async def check_stock(url, store, retries=3):
                         await browser.close()
                         return None, "403 Forbidden", None, False
 
-                    # Define stock status terms
-                    in_stock_terms = [
-                        "in stock", "add to cart", "buy now",
-                        "get it by", "arrives before", "free delivery", "pre-order now",
-                        "ships from and sold by amazon.co.uk",
-                        "in stock on", "order now", "ready to ship",
-                        "only 1 left", "only 2 left", "only 3 left", "only 4 left", "only 5 left",
-                        "only 6 left", "only 7 left", "only 8 left", "only 9 left", "only 10 left",
-                        "only 11 left", "only 12 left", "only 13 left", "only 14 left", "only 15 left",
-                        "in stock soon", "arrives", "dispatched", "usually dispatched"
-                    ]
-                    low_stock_terms = [f"only {i} left in stock" for i in range(1, 16)]
-                    low_stock_terms.extend([f"only {i} left in stock (more on the way)" for i in range(1, 16)])
-                    in_stock_terms.extend(low_stock_terms)
-
-                    out_of_stock_terms = [
-                        "currently unavailable", "out of stock", "temporarily out of stock",
-                        "we don’t know when or if this item will be back in stock",
-                        "see all buying options", "unavailable",
-                        "this item cannot be dispatched to your selected delivery location"
-                    ]
-
                     # Store-specific checks
-                    if store == "Pokemon Center UK":
-                        stock_element = await page.query_selector('button.add-to-cart')
-                        is_in_stock = bool(stock_element)
-                        reason = "Add to Cart button found" if is_in_stock else "No Add to Cart button"
-                        image_elem = await page.query_selector('img.product-image')
-                        image_url = await image_elem.get_attribute('src') if image_elem else None
-                        is_low_stock = False
-                    elif store == "Smyths Toys":
-                        stock_element = await page.query_selector('text=In Stock')
-                        is_in_stock = bool(stock_element)
-                        reason = "In Stock text found" if is_in_stock else "No In Stock text"
-                        image_elem = await page.query_selector('img[data-main-image]')
-                        image_url = await image_elem.get_attribute('src') if image_elem else None
-                        is_low_stock = False
-                    else:  # Amazon UK
-                        # Check multiple elements for stock status
-                        selectors = [
-                            "#availability",
-                            ".a-section.a-spacing-none.a-spacing-top-mini",
-                            "#availability_feature_div",
-                            ".a-size-medium.a-color-success",
-                            ".a-size-medium.a-color-price",
-                            "#availability span",
-                            "#availability_feature_div span"
-                        ]
-                        availability_text = ""
-                        for selector in selectors:
-                            element = await page.query_selector(selector)
-                            if element:
-                                text = await element.inner_text()
-                                if text:
-                                    availability_text = text.lower().strip()
-                                    logger.debug(f"Found availability text with selector {selector}: {availability_text}")
-                                    break
+                    in_stock = await check_stock(page, url, store)  # Using the new check_stock function here
+                    if in_stock:
+                        reason = f"{store} - In stock detected"
+                    else:
+                        reason = f"{store} - Out of stock or failed to detect"
 
-                        # Check buttons
-                        add_to_cart = await page.query_selector("#add-to-cart-button") or \
-                                      await page.query_selector('input[title="Add to Basket"]')
-                        buy_now = await page.query_selector("#buy-now-button") or \
-                                  await page.query_selector('input[title="Buy Now"]')
-
-                        # Check delivery message
-                        delivery_selectors = [
-                            "#deliveryBlockMessage",
-                            ".a-section.a-spacing-mini",
-                            "#mir-layout-DELIVERY_BLOCK-slot-PRIMARY_DELIVERY_MESSAGE_LARGE",
-                            "#mir-layout-DELIVERY_BLOCK-slot-SECONDARY_DELIVERY_MESSAGE"
-                        ]
-                        delivery_text = ""
-                        for selector in delivery_selectors:
-                            element = await page.query_selector(selector)
-                            if element:
-                                text = await element.inner_text()
-                                if text:
-                                    delivery_text = text.lower().strip()
-                                    logger.debug(f"Found delivery text with selector {selector}: {delivery_text}")
-                                    break
-
-                        # Check seller
-                        seller_selectors = [
-                            "#merchant-info",
-                            "#sellerProfileTriggerId",
-                            "#bylineInfo",
-                            ".offer-display-feature-text-message"
-                        ]
-                        seller_text = ""
-                        for selector in seller_selectors:
-                            element = await page.query_selector(selector)
-                            if element:
-                                text = await element.inner_text()
-                                if text:
-                                    seller_text = text.lower().strip()
-                                    logger.debug(f"Found seller text with selector {selector}: {seller_text}")
-                                    break
-                        is_amazon_seller = "amazon" in seller_text or "ships from and sold by amazon.co.uk" in availability_text
-
-                        # Log for debugging
-                        logger.info(f"Checking {url}: availability='{availability_text}', delivery='{delivery_text}', add_to_cart={bool(add_to_cart)}, buy_now={bool(buy_now)}, seller_text='{seller_text}'")
-
-                        # Determine stock status
-                        is_in_stock = False
-                        is_low_stock = False
-                        reason = "Unknown"
-
-                        # Prioritize buttons as the most reliable indicator
-                        if add_to_cart or buy_now:
-                            is_in_stock = True
-                            reason = "Add to Cart or Buy Now button found"
-                        elif any(term in availability_text for term in out_of_stock_terms) or \
-                             any(term in delivery_text for term in out_of_stock_terms):
-                            is_in_stock = False
-                            reason = f"Out of stock text found: {availability_text[:50]}..."
-                        elif any(term in availability_text for term in in_stock_terms) or \
-                             any(term in delivery_text for term in in_stock_terms):
-                            is_in_stock = True
-                            reason = f"In stock text found: {availability_text[:50]}... (delivery: {delivery_text[:50]}...)"
-                        else:
-                            is_in_stock = False
-                            reason = "No stock indicators found"
-
-                        # Check low stock
-                        if is_in_stock and any(term in availability_text for term in low_stock_terms):
-                            is_low_stock = True
-                            reason = f"Low stock: {availability_text[:50]}..."
-
-                        # Get product image
-                        image_selectors = [
-                            "img#landingImage",
-                            ".a-dynamic-image",
-                            "img#main-image",
-                            ".imgTagWrapper img"
-                        ]
-                        image_url = None
-                        for selector in image_selectors:
-                            image_elem = await page.query_selector(selector)
-                            if image_elem:
-                                image_url = await image_elem.get_attribute("src")
-                                if image_url:
-                                    break
-
+                    image_elem = await page.query_selector('img.product-image')
+                    image_url = await image_elem.get_attribute('src') if image_elem else None
+                    is_low_stock = False
                     await browser.close()
-                    logger.info(f"Stock check result for {url}: in_stock={is_in_stock}, low_stock={is_low_stock}, reason='{reason}'")
-                    return is_in_stock, reason, image_url, is_low_stock
+                    return in_stock, reason, image_url, is_low_stock
+
                 except PlaywrightError as e:
                     logger.warning(f"Attempt {attempt + 1} failed for {url}: {str(e)}")
                     if attempt < retries - 1:
