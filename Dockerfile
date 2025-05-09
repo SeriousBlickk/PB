@@ -1,13 +1,14 @@
-# Use Playwright's Ubuntu-based image with dependencies
-FROM mcr.microsoft.com/playwright:v1.44.0-jammy
+# Use a lightweight Python base image
+FROM python:3.10-slim
 
 # Set working directory
 WORKDIR /app
 
-# Install Python 3.10 and dependencies
-RUN apt-get update && \
-    apt-get install -y python3.10 python3-pip python3.10-venv && \
-    ln -s /usr/bin/python3.10 /usr/bin/python
+# Install dependencies
+RUN apt-get update -qq && \
+    apt-get install -y --no-install-recommends && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
 
 # Copy project files
 COPY . .
