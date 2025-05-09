@@ -30,6 +30,9 @@ apt-get install -y \
   libenchant-2-2 \
   libsecret-1-0 \
   libmanette-0.2-0 \
-  libgles2
+  libgles2 \
+  libwebkit2gtk-4.0-37 \
+  libgtk-3-0 \
+  libegl1
 # Install Playwright browsers
 playwright install
