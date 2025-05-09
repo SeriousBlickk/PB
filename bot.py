@@ -2,11 +2,11 @@ import discord
 from discord.ext import commands, tasks
 import json
 import aiohttp
-from playwright.async_api import async_playwright
+from playwright.async_api import async_playwright, Error as PlaywrightError
 from dotenv import load_dotenv
 import os
 from discord import ButtonStyle
-from discord.ui import Button, View
+from discord.ui import Button, View, Modal, TextInput
 import logging
 import asyncio
 import random
@@ -51,6 +51,41 @@ async def health_check():
     site = web.TCPSite(runner, '0.0.0.0', PORT)
     await site.start()
 
+# Modal for adding stores
+class AddStoreModal(Modal, title="Add Store"):
+    store_name = TextInput(label="Store Name", placeholder="e.g., Amazon UK")
+    store_url = TextInput(label="Store URL", placeholder="e.g., https://www.amazon.co.uk")
+
+    async def on_submit(self, interaction: discord.Interaction):
+        name = self.store_name.value.strip()
+        url = self.store_url.value.strip()
+        if not name or not url:
+            await interaction.response.send_message("Both fields are required.", ephemeral=True)
+            return
+        config['stores'][name] = url
+        save_config(config)
+        await interaction.response.send_message(f"Added store: {name} ({url})", ephemeral=True)
+
+# Modal for adding items
+class AddItemModal(Modal, title="Add Item"):
+    item_name = TextInput(label="Item Name", placeholder="e.g., Prismatic Evolutions ETB")
+    item_url = TextInput(label="Item URL", placeholder="e.g., https://www.amazon.co.uk/product/...")
+    store_name = TextInput(label="Store Name", placeholder="e.g., Amazon UK")
+
+    async def on_submit(self, interaction: discord.Interaction):
+        name = self.item_name.value.strip()
+        url = self.item_url.value.strip()
+        store = self.store_name.value.strip()
+        if not name or not url or not store:
+            await interaction.response.send_message("All fields are required.", ephemeral=True)
+            return
+        if store not in config['stores']:
+            await interaction.response.send_message(f"Store '{store}' not found.", ephemeral=True)
+            return
+        config['items'][name] = {'url': url, 'store': store, 'last_status': None, 'last_low_stock': None}
+        save_config(config)
+        await interaction.response.send_message(f"Added item: {name} ({url}) for {store}", ephemeral=True)
+
 # Button-based UI
 class StockBotView(View):
     async def send_embed(self, channel):
@@ -63,34 +98,11 @@ class StockBotView(View):
 
     @discord.ui.button(label="Add Store", style=ButtonStyle.green)
     async def add_store(self, interaction: discord.Interaction, button: Button):
-        await interaction.response.send_message("Please provide the store name and URL (e.g., `Pokemon Center UK, https://uk.pokemoncenter.com`):", ephemeral=True)
-        def check(m):
-            return m.author == interaction.user and m.channel == interaction.channel
-        try:
-            msg = await bot.wait_for('message', check=check, timeout=60.0)
-            name, url = map(str.strip, msg.content.split(',', 1))
-            config['stores'][name] = url
-            save_config(config)
-            await interaction.followup.send(f"Added store: {name} ({url})", ephemeral=True)
-        except:
-            await interaction.followup.send("Invalid format or timeout. Use: `name, url`", ephemeral=True)
+        await interaction.response.send_modal(AddStoreModal())
 
     @discord.ui.button(label="Add Item", style=ButtonStyle.green)
     async def add_item(self, interaction: discord.Interaction, button: Button):
-        await interaction.response.send_message("Please provide the item name, URL, and store name (e.g., `Prismatic Evolutions ETB, https://uk.pokemoncenter.com/product/..., Pokemon Center UK`):", ephemeral=True)
-        def check(m):
-            return m.author == interaction.user and m.channel == interaction.channel
-        try:
-            msg = await bot.wait_for('message', check=check, timeout=60.0)
-            name, url, store = map(str.strip, msg.content.split(',', 2))
-            if store not in config['stores']:
-                await interaction.followup.send(f"Store '{store}' not found.", ephemeral=True)
-                return
-            config['items'][name] = {'url': url, 'store': store, 'last_status': None, 'last_low_stock': None}
-            save_config(config)
-            await interaction.followup.send(f"Added item: {name} ({url}) for {store}", ephemeral=True)
-        except:
-            await interaction.followup.send("Invalid format or timeout. Use: `name, url, store`", ephemeral=True)
+        await interaction.response.send_modal(AddItemModal())
 
     @discord.ui.button(label="Remove Store", style=ButtonStyle.red)
     async def remove_store(self, interaction: discord.Interaction, button: Button):
@@ -123,7 +135,7 @@ class StockBotView(View):
                 save_config(config)
                 await interaction.followup.send(f"Removed item: {name}", ephemeral=True)
             else:
-                interaction.followup.send(f"Item '{name}' not found.", ephemeral=True)
+                await interaction.followup.send(f"Item '{name}' not found.", ephemeral=True)
         except:
             await interaction.followup.send("Timeout.", ephemeral=True)
 
@@ -136,116 +148,131 @@ class StockBotView(View):
             await channel.send(embed=result)
         await interaction.followup.send("Stock check completed.", ephemeral=True)
 
-# Stock checking logic
-async def check_stock(url, store):
+# Stock checking logic with retries
+async def check_stock(url, store, retries=2):
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         context = await browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-            viewport={"width": 1280, "height": 720}
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            viewport={"width": 1280, "height": 720},
+            extra_http_headers={
+                "Accept-Language": "en-US,en;q=0.9",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8"
+            }
         )
         page = await context.new_page()
-        try:
-            # Navigate with timeout and wait for dynamic content
-            await page.goto(url, timeout=30000, wait_until="domcontentloaded")
-            await page.wait_for_timeout(random.randint(2000, 5000))  # Random delay for anti-bot
+        for attempt in range(retries):
+            try:
+                # Navigate with increased timeout
+                await page.goto(url, timeout=60000, wait_until="domcontentloaded")
+                await page.wait_for_timeout(random.randint(3000, 7000))  # Random delay for anti-bot
 
-            # Check for CAPTCHA
-            captcha = await page.query_selector('text="Enter the characters you see below"')
-            if captcha:
-                logger.error(f"CAPTCHA detected on {url}")
-                return False, "Blocked by CAPTCHA", None, False
+                # Check for CAPTCHA
+                captcha = await page.query_selector('text="Enter the characters you see below"')
+                if captcha:
+                    logger.error(f"CAPTCHA detected on {url}, attempt {attempt + 1}")
+                    if attempt < retries - 1:
+                        await page.wait_for_timeout(random.randint(5000, 10000))
+                        continue
+                    return None, "Blocked by CAPTCHA", None, False
 
-            # Define stock status terms
-            in_stock_terms = [
-                "in stock", "available to ship", "add to cart", "buy now",
-                "get it by", "arrives before", "free delivery", "pre-order now",
-                "available from", "ships from and sold by amazon.co.uk"
-            ]
-            low_stock_terms = [f"only {i} left in stock" for i in range(1, 16)]
-            low_stock_terms.extend([f"only {i} left in stock (more on the way)" for i in range(1, 16)])
-            in_stock_terms.extend(low_stock_terms)
+                # Define stock status terms
+                in_stock_terms = [
+                    "in stock", "available to ship", "add to cart", "buy now",
+                    "get it by", "arrives before", "free delivery", "pre-order now",
+                    "available from", "ships from and sold by amazon.co.uk"
+                ]
+                low_stock_terms = [f"only {i} left in stock" for i in range(1, 16)]
+                low_stock_terms.extend([f"only {i} left in stock (more on the way)" for i in range(1, 16)])
+                in_stock_terms.extend(low_stock_terms)
 
-            out_of_stock_terms = [
-                "currently unavailable", "out of stock", "temporarily out of stock",
-                "we don’t know when or if this item will be back in stock",
-                "see all buying options"
-            ]
+                out_of_stock_terms = [
+                    "currently unavailable", "out of stock", "temporarily out of stock",
+                    "we don’t know when or if this item will be back in stock",
+                    "see all buying options"
+                ]
 
-            # Store-specific checks
-            if store == "Pokemon Center UK":
-                stock_element = await page.query_selector('button.add-to-cart')
-                is_in_stock = bool(stock_element)
-                reason = "Add to Cart button found" if is_in_stock else "No Add to Cart button"
-                image_elem = await page.query_selector('img.product-image')
-                image_url = await image_elem.get_attribute('src') if image_elem else None
-                is_low_stock = False
-            elif store == "Smyths Toys":
-                stock_element = await page.query_selector('text=In Stock')
-                is_in_stock = bool(stock_element)
-                reason = "In Stock text found" if is_in_stock else "No In Stock text"
-                image_elem = await page.query_selector('img[data-main-image]')
-                image_url = await image_elem.get_attribute('src') if image_elem else None
-                is_low_stock = False
-            else:  # Amazon UK
-                # Check availability div
-                availability = await page.query_selector("#availability")
-                availability_text = await availability.inner_text() if availability else ""
-                availability_text = availability_text.lower()
+                # Store-specific checks
+                if store == "Pokemon Center UK":
+                    stock_element = await page.query_selector('button.add-to-cart')
+                    is_in_stock = bool(stock_element)
+                    reason = "Add to Cart button found" if is_in_stock else "No Add to Cart button"
+                    image_elem = await page.query_selector('img.product-image')
+                    image_url = await image_elem.get_attribute('src') if image_elem else None
+                    is_low_stock = False
+                elif store == "Smyths Toys":
+                    stock_element = await page.query_selector('text=In Stock')
+                    is_in_stock = bool(stock_element)
+                    reason = "In Stock text found" if is_in_stock else "No In Stock text"
+                    image_elem = await page.query_selector('img[data-main-image]')
+                    image_url = await image_elem.get_attribute('src') if image_elem else None
+                    is_low_stock = False
+                else:  # Amazon UK
+                    # Check availability div
+                    availability = await page.query_selector("#availability")
+                    availability_text = await availability.inner_text() if availability else ""
+                    availability_text = availability_text.lower()
 
-                # Check buttons
-                add_to_cart = await page.query_selector("#add-to-cart-button")
-                buy_now = await page.query_selector("#buy-now-button")
+                    # Check buttons
+                    add_to_cart = await page.query_selector("#add-to-cart-button")
+                    buy_now = await page.query_selector("#buy-now-button")
 
-                # Check delivery message
-                delivery = await page.query_selector("#deliveryBlockMessage")
-                delivery_text = await delivery.inner_text() if delivery else ""
+                    # Check delivery message
+                    delivery = await page.query_selector("#deliveryBlockMessage")
+                    delivery_text = await delivery.inner_text() if delivery else ""
 
-                # Check seller
-                seller = await page.query_selector("#merchant-info")
-                seller_text = await seller.inner_text() if seller else ""
-                is_amazon_seller = "amazon" in seller_text.lower() or "ships from and sold by amazon.co.uk" in availability_text
+                    # Check seller
+                    seller = await page.query_selector("#merchant-info")
+                    seller_text = await seller.inner_text() if seller else ""
+                    is_amazon_seller = "amazon" in seller_text.lower() or "ships from and sold by amazon.co.uk" in availability_text
 
-                # Determine stock status
-                is_in_stock = False
-                is_low_stock = False
-                reason = "Unknown"
-
-                if add_to_cart or buy_now:
-                    is_in_stock = True
-                    reason = "Add to Cart or Buy Now button found"
-                elif any(term in availability_text for term in in_stock_terms) or \
-                     any(term in delivery_text.lower() for term in in_stock_terms):
-                    is_in_stock = True
-                    reason = f"In stock text found: {availability_text[:50]}..."
-                elif any(term in availability_text for term in out_of_stock_terms):
-                    is_in_stock = False
-                    reason = "Out of stock text found"
-                elif not availability_text and not add_to_cart and not buy_now:
-                    is_in_stock = False
-                    reason = "No stock indicators found"
-
-                # Check low stock
-                if is_in_stock and any(term in availability_text for term in low_stock_terms):
-                    is_low_stock = True
-                    reason = f"Low stock: {availability_text[:50]}..."
-
-                # Prefer Amazon direct stock
-                if is_in_stock and not is_amazon_seller:
+                    # Determine stock status
                     is_in_stock = False
                     is_low_stock = False
-                    reason = "In stock by third-party seller, not Amazon"
+                    reason = "Unknown"
 
-                # Get product image
-                image_elem = await page.query_selector("img#landingImage")
-                image_url = await image_elem.get_attribute("src") if image_elem else None
+                    if add_to_cart or buy_now:
+                        is_in_stock = True
+                        reason = "Add to Cart or Buy Now button found"
+                    elif any(term in availability_text for term in in_stock_terms) or \
+                         any(term in delivery_text.lower() for term in in_stock_terms):
+                        is_in_stock = True
+                        reason = f"In stock text found: {availability_text[:50]}..."
+                    elif any(term in availability_text for term in out_of_stock_terms):
+                        is_in_stock = False
+                        reason = "Out of stock text found"
+                    elif not availability_text and not add_to_cart and not buy_now:
+                        is_in_stock = False
+                        reason = "No stock indicators found"
 
-            await browser.close()
-            return is_in_stock, reason, image_url, is_low_stock
-        except Exception as e:
-            logger.error(f"Error checking {url}: {str(e)}")
-            await browser.close()
-            return False, f"Error: {str(e)}", None, False
+                    # Check low stock
+                    if is_in_stock and any(term in availability_text for term in low_stock_terms):
+                        is_low_stock = True
+                        reason = f"Low stock: {availability_text[:50]}..."
+
+                    # Prefer Amazon direct stock
+                    if is_in_stock and not is_amazon_seller:
+                        is_in_stock = False
+                        is_low_stock = False
+                        reason = "In stock by third-party seller, not Amazon"
+
+                    # Get product image
+                    image_elem = await page.query_selector("img#landingImage")
+                    image_url = await image_elem.get_attribute("src") if image_elem else None
+
+                await browser.close()
+                return is_in_stock, reason, image_url, is_low_stock
+            except PlaywrightError as e:
+                logger.warning(f"Attempt {attempt + 1} failed for {url}: {str(e)}")
+                if attempt < retries - 1:
+                    await page.wait_for_timeout(random.randint(5000, 10000))
+                    continue
+                await browser.close()
+                return None, f"Error after retries: {str(e)}", None, False
+            except Exception as e:
+                logger.error(f"Unexpected error checking {url}: {str(e)}")
+                await browser.close()
+                return None, f"Unexpected error: {str(e)}", None, False
 
 async def check_all_stock():
     results = []
@@ -254,7 +281,12 @@ async def check_all_stock():
         store = item_data['store']
         last_status = item_data.get('last_status')
         last_low_stock = item_data.get('last_low_stock')
-        is_in_stock, reason, image_url, is_low_stock = await check_stock(url, store)
+        is_in_stock, reason, image_url, is_low_stock = await check_stock(url, store, retries=2)
+
+        # Skip if check failed (e.g., timeout, CAPTCHA)
+        if is_in_stock is None:
+            logger.info(f"Skipping notification for {item_name} due to {reason}")
+            continue
 
         # Notify for in-stock or low-stock changes
         if is_in_stock:
