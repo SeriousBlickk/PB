@@ -181,13 +181,15 @@ async def check_stock(url, store, retries=3):
             try:
                 # Navigate with increased timeout
                 await page.goto(url, timeout=90000, wait_until="networkidle")
-                await page.wait_for_timeout(random.randint(5000, 10000))  # Increased delay for JS rendering
+                # Wait for stock-related elements to appear
+                await page.wait_for_selector("#availability, #add-to-cart-button, #buy-now-button, .a-section", timeout=10000)
+                await page.wait_for_timeout(random.randint(5000, 10000))
 
                 # Log page content for debugging
                 content = await page.content()
                 logger.debug(f"Page content for {url}: {content[:1000]}...")
 
-                # Check for CAPTCHA
+                # Check for CAPTCHA or bot detection
                 captcha = await page.query_selector('text="Enter the characters you see below"') or \
                           await page.query_selector('form[action*="/errors/validateCaptcha"]')
                 if captcha:
@@ -197,15 +199,14 @@ async def check_stock(url, store, retries=3):
                         continue
                     return None, "Blocked by CAPTCHA", None, False
 
-                # Check for redirect or error page
                 if "sorry" in (await page.title()).lower() or "robot" in (await page.title()).lower():
-                    logger.warning(f"Possible bot detection or redirect on {url}, attempt {attempt + 1}")
+                    logger.warning(f"Bot detection or redirect on {url}, attempt {attempt + 1}")
                     if attempt < retries - 1:
                         await page.wait_for_timeout(random.randint(5000, 10000))
                         continue
                     return None, "Bot detection or redirect", None, False
 
-                # Define stock status terms
+                # Define stock status terms (case-insensitive matching handled later)
                 in_stock_terms = [
                     "in stock", "available to ship", "add to cart", "buy now",
                     "get it by", "arrives before", "free delivery", "pre-order now",
@@ -213,7 +214,8 @@ async def check_stock(url, store, retries=3):
                     "in stock on", "order now", "stock available", "ready to ship",
                     "only 1 left", "only 2 left", "only 3 left", "only 4 left", "only 5 left",
                     "only 6 left", "only 7 left", "only 8 left", "only 9 left", "only 10 left",
-                    "only 11 left", "only 12 left", "only 13 left", "only 14 left", "only 15 left"
+                    "only 11 left", "only 12 left", "only 13 left", "only 14 left", "only 15 left",
+                    "in stock soon", "arrives", "dispatched", "usually dispatched"
                 ]
                 low_stock_terms = [f"only {i} left in stock" for i in range(1, 16)]
                 low_stock_terms.extend([f"only {i} left in stock (more on the way)" for i in range(1, 16)])
@@ -249,7 +251,10 @@ async def check_stock(url, store, retries=3):
                         ".a-size-medium.a-color-success",
                         ".a-size-medium.a-color-price",
                         "#availability span",
-                        "#availability_feature_div span"
+                        "#availability_feature_div span",
+                        ".a-section.a-spacing-small.a-spacing-top-small",
+                        "#outOfStock",  # Sometimes used for out-of-stock
+                        ".a-declarative[data-action='show-all-offers-display']"
                     ]
                     availability_text = ""
                     for selector in selectors:
@@ -257,21 +262,26 @@ async def check_stock(url, store, retries=3):
                         if element:
                             text = await element.inner_text()
                             if text:
-                                availability_text = text.lower().strip()
+                                availability_text = text.strip()
+                                logger.debug(f"Found availability text with {selector}: '{availability_text}'")
                                 break
 
                     # Check buttons
                     add_to_cart = await page.query_selector("#add-to-cart-button") or \
-                                  await page.query_selector('input[title="Add to Basket"]')
+                                  await page.query_selector('input[title="Add to Basket"]') or \
+                                  await page.query_selector('button[title="Add to Basket"]')
                     buy_now = await page.query_selector("#buy-now-button") or \
-                              await page.query_selector('input[title="Buy Now"]')
+                              await page.query_selector('input[title="Buy Now"]') or \
+                              await page.query_selector('button[title="Buy Now"]')
 
                     # Check delivery message
                     delivery_selectors = [
                         "#deliveryBlockMessage",
                         ".a-section.a-spacing-mini",
                         "#mir-layout-DELIVERY_BLOCK-slot-PRIMARY_DELIVERY_MESSAGE_LARGE",
-                        "#mir-layout-DELIVERY_BLOCK-slot-SECONDARY_DELIVERY_MESSAGE"
+                        "#mir-layout-DELIVERY_BLOCK-slot-SECONDARY_DELIVERY_MESSAGE",
+                        "#delivery-message",
+                        ".a-row.a-size-base.a-color-base"
                     ]
                     delivery_text = ""
                     for selector in delivery_selectors:
@@ -279,7 +289,8 @@ async def check_stock(url, store, retries=3):
                         if element:
                             text = await element.inner_text()
                             if text:
-                                delivery_text = text.lower().strip()
+                                delivery_text = text.strip()
+                                logger.debug(f"Found delivery text with {selector}: '{delivery_text}'")
                                 break
 
                     # Check seller
@@ -287,7 +298,9 @@ async def check_stock(url, store, retries=3):
                         "#merchant-info",
                         "#sellerProfileTriggerId",
                         "#bylineInfo",
-                        ".offer-display-feature-text-message"
+                        ".offer-display-feature-text-message",
+                        "#ships-from-sold-by",
+                        ".a-row.a-size-small"
                     ]
                     seller_text = ""
                     for selector in seller_selectors:
@@ -295,12 +308,22 @@ async def check_stock(url, store, retries=3):
                         if element:
                             text = await element.inner_text()
                             if text:
-                                seller_text = text.lower().strip()
+                                seller_text = text.strip()
+                                logger.debug(f"Found seller text with {selector}: '{seller_text}'")
                                 break
-                    is_amazon_seller = "amazon" in seller_text or "ships from and sold by amazon.co.uk" in availability_text
+
+                    # Make text matching case-insensitive
+                    availability_text_lower = availability_text.lower()
+                    delivery_text_lower = delivery_text.lower()
+                    seller_text_lower = seller_text.lower()
+                    is_amazon_seller = "amazon" in seller_text_lower or "ships from and sold by amazon.co.uk" in availability_text_lower
 
                     # Log for debugging
                     logger.info(f"Checking {url}: availability='{availability_text}', delivery='{delivery_text}', add_to_cart={bool(add_to_cart)}, buy_now={bool(buy_now)}, seller_text='{seller_text}'")
+
+                    # Fallback: Search entire page for stock indicators
+                    full_page_text = (await page.inner_text('body')).lower()
+                    logger.debug(f"Full page text (first 1000 chars): {full_page_text[:1000]}...")
 
                     # Determine stock status
                     is_in_stock = False
@@ -312,22 +335,27 @@ async def check_stock(url, store, retries=3):
                         is_in_stock = True
                         reason = "Add to Cart or Buy Now button found"
                     # Check availability and delivery text
-                    elif any(term in availability_text for term in in_stock_terms) or \
-                         any(term in delivery_text for term in in_stock_terms):
+                    elif any(term in availability_text_lower for term in in_stock_terms) or \
+                         any(term in delivery_text_lower for term in in_stock_terms):
                         is_in_stock = True
                         reason = f"In stock text found: {availability_text[:50]}... (delivery: {delivery_text[:50]}...)"
+                    # Fallback: Check full page text
+                    elif any(term in full_page_text for term in in_stock_terms):
+                        is_in_stock = True
+                        reason = f"In stock text found in page body: {full_page_text[:50]}..."
                     # Check out-of-stock indicators
-                    elif any(term in availability_text for term in out_of_stock_terms) or \
-                         any(term in delivery_text for term in out_of_stock_terms):
+                    elif any(term in availability_text_lower for term in out_of_stock_terms) or \
+                         any(term in delivery_text_lower for term in out_of_stock_terms) or \
+                         any(term in full_page_text for term in out_of_stock_terms):
                         is_in_stock = False
                         reason = f"Out of stock text found: {availability_text[:50]}..."
                     # Fallback: no indicators
-                    elif not availability_text and not delivery_text and not add_to_cart and not buy_now:
+                    else:
                         is_in_stock = False
-                        reason = "No stock indicators found"
+                        reason = "No stock indicators found in selectors or page text"
 
                     # Check low stock
-                    if is_in_stock and any(term in availability_text for term in low_stock_terms):
+                    if is_in_stock and any(term in availability_text_lower for term in low_stock_terms):
                         is_low_stock = True
                         reason = f"Low stock: {availability_text[:50]}..."
 
@@ -342,7 +370,8 @@ async def check_stock(url, store, retries=3):
                         "img#landingImage",
                         ".a-dynamic-image",
                         "img#main-image",
-                        ".imgTagWrapper img"
+                        ".imgTagWrapper img",
+                        "img[data-a-dynamic-image]"
                     ]
                     image_url = None
                     for selector in image_selectors:
@@ -350,6 +379,7 @@ async def check_stock(url, store, retries=3):
                         if image_elem:
                             image_url = await image_elem.get_attribute("src")
                             if image_url:
+                                logger.debug(f"Found image with {selector}: {image_url}")
                                 break
 
                 await browser.close()
