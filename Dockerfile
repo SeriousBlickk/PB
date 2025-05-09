@@ -4,6 +4,14 @@ FROM mcr.microsoft.com/playwright:v1.44.0-jammy
 # Set working directory
 WORKDIR /app
 
+# Install Python and pip
+RUN apt-get update && \
+    apt-get install -y python3 python3-pip python3-dev && \
+    ln -s /usr/bin/python3 /usr/bin/python && \
+    ln -s /usr/bin/pip3 /usr/bin/pip && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
 # Copy project files
 COPY . .
 
