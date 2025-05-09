@@ -12,7 +12,7 @@ import asyncio
 import random
 
 # Setup logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 # Load environment variables
@@ -53,8 +53,8 @@ async def health_check():
 
 # Modal for adding stores
 class AddStoreModal(Modal, title="Add Store"):
-    store_name = TextInput(label="Store Name", placeholder="e.g., Amazon UK")
-    store_url = TextInput(label="Store URL", placeholder="e.g., https://www.amazon.co.uk")
+    store_name = TextInput(label="Store Name", placeholder="e.g., Amazon UK", required=True)
+    store_url = TextInput(label="Store URL", placeholder="e.g., https://www.amazon.co.uk", required=True)
 
     async def on_submit(self, interaction: discord.Interaction):
         name = self.store_name.value.strip()
@@ -68,9 +68,9 @@ class AddStoreModal(Modal, title="Add Store"):
 
 # Modal for adding items
 class AddItemModal(Modal, title="Add Item"):
-    item_name = TextInput(label="Item Name", placeholder="e.g., Prismatic Evolutions ETB")
-    item_url = TextInput(label="Item URL", placeholder="e.g., https://www.amazon.co.uk/product/...")
-    store_name = TextInput(label="Store Name", placeholder="e.g., Amazon UK")
+    item_name = TextInput(label="Item Name", placeholder="e.g., Prismatic Evolutions ETB", required=True)
+    item_url = TextInput(label="Item URL", placeholder="e.g., https://www.amazon.co.uk/product/...", required=True)
+    store_name = TextInput(label="Store Name", placeholder="e.g., Amazon UK", required=True)
 
     async def on_submit(self, interaction: discord.Interaction):
         name = self.item_name.value.strip()
@@ -80,7 +80,7 @@ class AddItemModal(Modal, title="Add Item"):
             await interaction.response.send_message("All fields are required.", ephemeral=True)
             return
         if store not in config['stores']:
-            await interaction.response.send_message(f"Store '{store}' not found.", ephemeral=True)
+            await interaction.response.send_message(f"Store '{store}' not found. Add it first.", ephemeral=True)
             return
         config['items'][name] = {'url': url, 'store': store, 'last_status': None, 'last_low_stock': None}
         save_config(config)
@@ -91,7 +91,7 @@ class StockBotView(View):
     async def send_embed(self, channel):
         embed = discord.Embed(
             title="StockBot Setup",
-            description="Type `/setup` in #stock-alerts to start. Use the buttons below to manage stores and items. Stock alerts will ping @everyone in this channel. **Note**: Slash commands like `/additem` are not supported; use the buttons.",
+            description="Type `/setup` in #stock-alerts to start. Use the buttons below to manage stores and items. Stock alerts will ping @everyone in this channel.",
             color=discord.Color.blue()
         )
         await channel.send(embed=embed, view=self)
@@ -120,7 +120,7 @@ class StockBotView(View):
             else:
                 await interaction.followup.send(f"Store '{name}' not found.", ephemeral=True)
         except:
-            await interaction.followup.send("Timeout.", ephemeral=True)
+            await interaction.followup.send("Timeout. Please try again.", ephemeral=True)
 
     @discord.ui.button(label="Remove Item", style=ButtonStyle.red)
     async def remove_item(self, interaction: discord.Interaction, button: Button):
@@ -137,33 +137,39 @@ class StockBotView(View):
             else:
                 await interaction.followup.send(f"Item '{name}' not found.", ephemeral=True)
         except:
-            await interaction.followup.send("Timeout.", ephemeral=True)
+            await interaction.followup.send("Timeout. Please try again.", ephemeral=True)
 
     @discord.ui.button(label="Check Stock Now", style=ButtonStyle.blurple)
     async def check_stock(self, interaction: discord.Interaction, button: Button):
         try:
             await interaction.response.defer(ephemeral=True)
-            results = await check_all_stock()
-            channel = bot.get_channel(int(config['channel_id']))
-            if not channel:
+            if not config['channel_id']:
                 await interaction.followup.send("Channel not set. Run `/setup` in #stock-alerts.", ephemeral=True)
                 return
+            channel = bot.get_channel(int(config['channel_id']))
+            if not channel:
+                await interaction.followup.send("Channel not found. Run `/setup` in #stock-alerts.", ephemeral=True)
+                return
+            results = await check_all_stock(manual=True)
             if results:
                 for result in results:
                     await channel.send(embed=result)
                 await interaction.followup.send("Stock check completed.", ephemeral=True)
             else:
-                await interaction.followup.send("No new stock updates.", ephemeral=True)
+                await interaction.followup.send("No new stock updates. Check URLs or try again.", ephemeral=True)
         except Exception as e:
             logger.error(f"Check stock failed: {str(e)}")
-            await interaction.followup.send("Failed to check stock. Please try again.", ephemeral=True)
+            await interaction.followup.send("Failed to check stock due to an error. Please try again later.", ephemeral=True)
 
 # Stock checking logic with retries
 async def check_stock(url, store, retries=3):
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         context = await browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            user_agent=random.choice([
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Safari/605.1.15"
+            ]),
             viewport={"width": 1280, "height": 720},
             extra_http_headers={
                 "Accept-Language": "en-GB,en-US;q=0.9",
@@ -174,8 +180,12 @@ async def check_stock(url, store, retries=3):
         for attempt in range(retries):
             try:
                 # Navigate with increased timeout
-                await page.goto(url, timeout=90000, wait_until="domcontentloaded")
+                await page.goto(url, timeout=90000, wait_until="networkidle")
                 await page.wait_for_timeout(random.randint(3000, 7000))
+
+                # Log page content for debugging
+                content = await page.content()
+                logger.debug(f"Page content for {url}: {content[:500]}...")
 
                 # Check for CAPTCHA
                 captcha = await page.query_selector('text="Enter the characters you see below"')
@@ -190,7 +200,10 @@ async def check_stock(url, store, retries=3):
                 in_stock_terms = [
                     "in stock", "available to ship", "add to cart", "buy now",
                     "get it by", "arrives before", "free delivery", "pre-order now",
-                    "available from", "ships from and sold by amazon.co.uk"
+                    "available from", "ships from and sold by amazon.co.uk",
+                    "only 1 left", "only 2 left", "only 3 left", "only 4 left", "only 5 left",
+                    "only 6 left", "only 7 left", "only 8 left", "only 9 left", "only 10 left",
+                    "only 11 left", "only 12 left", "only 13 left", "only 14 left", "only 15 left"
                 ]
                 low_stock_terms = [f"only {i} left in stock" for i in range(1, 16)]
                 low_stock_terms.extend([f"only {i} left in stock (more on the way)" for i in range(1, 16)])
@@ -218,23 +231,29 @@ async def check_stock(url, store, retries=3):
                     image_url = await image_elem.get_attribute('src') if image_elem else None
                     is_low_stock = False
                 else:  # Amazon UK
-                    # Check availability div
-                    availability = await page.query_selector("#availability")
+                    # Check availability div with fallback selectors
+                    availability = await page.query_selector("#availability") or \
+                                   await page.query_selector(".a-section.a-spacing-none.a-spacing-top-mini")
                     availability_text = await availability.inner_text() if availability else ""
-                    availability_text = availability_text.lower()
+                    availability_text = availability_text.lower().strip()
 
                     # Check buttons
                     add_to_cart = await page.query_selector("#add-to-cart-button")
                     buy_now = await page.query_selector("#buy-now-button")
 
                     # Check delivery message
-                    delivery = await page.query_selector("#deliveryBlockMessage")
+                    delivery = await page.query_selector("#deliveryBlockMessage") or \
+                               await page.query_selector(".a-section.a-spacing-mini")
                     delivery_text = await delivery.inner_text() if delivery else ""
 
                     # Check seller
-                    seller = await page.query_selector("#merchant-info")
+                    seller = await page.query_selector("#merchant-info") or \
+                             await page.query_selector("#sellerProfileTriggerId")
                     seller_text = await seller.inner_text() if seller else ""
                     is_amazon_seller = "amazon" in seller_text.lower() or "ships from and sold by amazon.co.uk" in availability_text
+
+                    # Log for debugging
+                    logger.info(f"Checking {url}: availability='{availability_text}', add_to_cart={bool(add_to_cart)}, buy_now={bool(buy_now)}, seller_text='{seller_text}'")
 
                     # Determine stock status
                     is_in_stock = False
@@ -267,10 +286,12 @@ async def check_stock(url, store, retries=3):
                         reason = "In stock by third-party seller, not Amazon"
 
                     # Get product image
-                    image_elem = await page.query_selector("img#landingImage")
+                    image_elem = await page.query_selector("img#landingImage") or \
+                                 await page.query_selector(".a-dynamic-image")
                     image_url = await image_elem.get_attribute("src") if image_elem else None
 
                 await browser.close()
+                logger.info(f"Stock check result for {url}: in_stock={is_in_stock}, low_stock={is_low_stock}, reason='{reason}'")
                 return is_in_stock, reason, image_url, is_low_stock
             except PlaywrightError as e:
                 logger.warning(f"Attempt {attempt + 1} failed for {url}: {str(e)}")
@@ -284,7 +305,7 @@ async def check_stock(url, store, retries=3):
                 await browser.close()
                 return None, f"Unexpected error: {str(e)}", None, False
 
-async def check_all_stock():
+async def check_all_stock(manual=False):
     results = []
     for item_name, item_data in config['items'].items():
         url = item_data['url']
@@ -298,12 +319,13 @@ async def check_all_stock():
             logger.info(f"Skipping notification for {item_name} due to: {reason}")
             continue
 
-        # Notify for in-stock or low-stock changes
+        # Notify for in-stock or low-stock
         if is_in_stock:
             title = f"{item_name} is IN STOCK at {store}!"
             if is_low_stock:
                 title = f"{item_name} LOW STOCK at {store}! ({reason})"
-            if (last_status != "in_stock" or (is_low_stock and last_low_stock != True)):
+            # Always notify on manual check or if status changed
+            if manual or (last_status != "in_stock" or (is_low_stock and last_low_stock != True)):
                 embed = discord.Embed(
                     title=title,
                     description=f"URL: {url}\nReason: {reason}",
@@ -315,7 +337,7 @@ async def check_all_stock():
                 results.append(embed)
                 config['items'][item_name]['last_status'] = "in_stock"
                 config['items'][item_name]['last_low_stock'] = is_low_stock
-        elif last_status != "out_of_stock":
+        else:
             config['items'][item_name]['last_status'] = "out_of_stock"
             config['items'][item_name]['last_low_stock'] = False
 
@@ -333,10 +355,11 @@ async def stock_checker():
         logger.error("Channel not found. Run `/setup` in #stock-alerts.")
         return
     try:
-        results = await check_all_stock()
+        results = await check_all_stock(manual=False)
         if results:
             for result in results:
                 await channel.send(content="@everyone", embed=result)
+            logger.info(f"Sent {len(results)} stock alerts to channel {config['channel_id']}")
     except Exception as e:
         logger.error(f"Stock checker failed: {str(e)}")
 
