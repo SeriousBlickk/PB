@@ -141,22 +141,32 @@ class StockBotView(View):
 
     @discord.ui.button(label="Check Stock Now", style=ButtonStyle.blurple)
     async def check_stock(self, interaction: discord.Interaction, button: Button):
-        await interaction.response.defer(ephemeral=True)
-        results = await check_all_stock()
-        channel = bot.get_channel(int(config['channel_id']))
-        for result in results:
-            await channel.send(embed=result)
-        await interaction.followup.send("Stock check completed.", ephemeral=True)
+        try:
+            await interaction.response.defer(ephemeral=True)
+            results = await check_all_stock()
+            channel = bot.get_channel(int(config['channel_id']))
+            if not channel:
+                await interaction.followup.send("Channel not set. Run `/setup` in #stock-alerts.", ephemeral=True)
+                return
+            if results:
+                for result in results:
+                    await channel.send(embed=result)
+                await interaction.followup.send("Stock check completed.", ephemeral=True)
+            else:
+                await interaction.followup.send("No new stock updates.", ephemeral=True)
+        except Exception as e:
+            logger.error(f"Check stock failed: {str(e)}")
+            await interaction.followup.send("Failed to check stock. Please try again.", ephemeral=True)
 
 # Stock checking logic with retries
-async def check_stock(url, store, retries=2):
+async def check_stock(url, store, retries=3):
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         context = await browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             viewport={"width": 1280, "height": 720},
             extra_http_headers={
-                "Accept-Language": "en-US,en;q=0.9",
+                "Accept-Language": "en-GB,en-US;q=0.9",
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8"
             }
         )
@@ -164,13 +174,13 @@ async def check_stock(url, store, retries=2):
         for attempt in range(retries):
             try:
                 # Navigate with increased timeout
-                await page.goto(url, timeout=60000, wait_until="domcontentloaded")
-                await page.wait_for_timeout(random.randint(3000, 7000))  # Random delay for anti-bot
+                await page.goto(url, timeout=90000, wait_until="domcontentloaded")
+                await page.wait_for_timeout(random.randint(3000, 7000))
 
                 # Check for CAPTCHA
                 captcha = await page.query_selector('text="Enter the characters you see below"')
                 if captcha:
-                    logger.error(f"CAPTCHA detected on {url}, attempt {attempt + 1}")
+                    logger.warning(f"CAPTCHA detected on {url}, attempt {attempt + 1}")
                     if attempt < retries - 1:
                         await page.wait_for_timeout(random.randint(5000, 10000))
                         continue
@@ -281,11 +291,11 @@ async def check_all_stock():
         store = item_data['store']
         last_status = item_data.get('last_status')
         last_low_stock = item_data.get('last_low_stock')
-        is_in_stock, reason, image_url, is_low_stock = await check_stock(url, store, retries=2)
+        is_in_stock, reason, image_url, is_low_stock = await check_stock(url, store)
 
         # Skip if check failed (e.g., timeout, CAPTCHA)
         if is_in_stock is None:
-            logger.info(f"Skipping notification for {item_name} due to {reason}")
+            logger.info(f"Skipping notification for {item_name} due to: {reason}")
             continue
 
         # Notify for in-stock or low-stock changes
@@ -316,11 +326,19 @@ async def check_all_stock():
 @tasks.loop(seconds=60)
 async def stock_checker():
     if not config['channel_id']:
+        logger.warning("No channel_id set. Run `/setup` in #stock-alerts.")
         return
     channel = bot.get_channel(int(config['channel_id']))
-    results = await check_all_stock()
-    for result in results:
-        await channel.send(content="@everyone", embed=result)
+    if not channel:
+        logger.error("Channel not found. Run `/setup` in #stock-alerts.")
+        return
+    try:
+        results = await check_all_stock()
+        if results:
+            for result in results:
+                await channel.send(content="@everyone", embed=result)
+    except Exception as e:
+        logger.error(f"Stock checker failed: {str(e)}")
 
 # Bot events and commands
 @bot.event
@@ -332,7 +350,14 @@ async def on_ready():
         if channel:
             view = StockBotView()
             await view.send_embed(channel)
-    stock_checker.start()
+            logger.info(f"Sent setup embed to channel {config['channel_id']}")
+        else:
+            logger.warning("Channel_id set but channel not found. Run `/setup`.")
+    else:
+        logger.warning("No channel_id set. Run `/setup` in #stock-alerts.")
+    if not stock_checker.is_running():
+        stock_checker.start()
+        logger.info("Started stock checker task.")
 
 @bot.command()
 async def setup(ctx):
@@ -341,5 +366,8 @@ async def setup(ctx):
     view = StockBotView()
     await view.send_embed(ctx.channel)
     await ctx.send("Setup complete! Use the buttons to manage stores and items.")
+    if not stock_checker.is_running():
+        stock_checker.start()
+        logger.info("Started stock checker task after setup.")
 
 bot.run(DISCORD_TOKEN)
