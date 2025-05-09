@@ -199,7 +199,11 @@ async def check_stock(url, store, retries=3):
                 "Sec-Fetch-Mode": "navigate",
                 "Sec-Fetch-Site": "none",
                 "Sec-Fetch-User": "?1"
-            }
+            },
+            java_script_enabled=True,
+            locale="en-GB",
+            geolocation={"latitude": 51.5074, "longitude": -0.1278},  # London coordinates
+            permissions=["geolocation"]
         )
         page = await context.new_page()
         for attempt in range(retries):
@@ -207,8 +211,19 @@ async def check_stock(url, store, retries=3):
                 # Random delay to mimic human behavior
                 await asyncio.sleep(random.uniform(0.5, 2.0))
 
-                # Navigate with timeout
-                await page.goto(url, timeout=30000, wait_until="networkidle")
+                # Navigate with increased timeout and relaxed wait condition
+                try:
+                    await page.goto(url, timeout=60000, wait_until="domcontentloaded")
+                except PlaywrightError as e:
+                    if "Timeout" in str(e):
+                        logger.warning(f"Timeout on {url}, attempt {attempt + 1}. Falling back to partial load check.")
+                        # Fallback: Check if page loaded partially
+                        title = await page.title()
+                        if title:
+                            logger.info(f"Page partially loaded for {url}: Title = {title}")
+                        else:
+                            raise e  # Re-raise if no content loaded
+
                 await page.wait_for_timeout(random.randint(3000, 5000))  # Wait for JS rendering
 
                 # Log page content for debugging
@@ -246,10 +261,10 @@ async def check_stock(url, store, retries=3):
 
                 # Define stock status terms
                 in_stock_terms = [
-                    "in stock", "available to ship", "add to cart", "buy now",
+                    "in stock", "add to cart", "buy now",
                     "get it by", "arrives before", "free delivery", "pre-order now",
-                    "available from", "available now", "ships from and sold by amazon.co.uk",
-                    "in stock on", "order now", "stock available", "ready to ship",
+                    "ships from and sold by amazon.co.uk",
+                    "in stock on", "order now", "ready to ship",
                     "only 1 left", "only 2 left", "only 3 left", "only 4 left", "only 5 left",
                     "only 6 left", "only 7 left", "only 8 left", "only 9 left", "only 10 left",
                     "only 11 left", "only 12 left", "only 13 left", "only 14 left", "only 15 left",
@@ -262,7 +277,8 @@ async def check_stock(url, store, retries=3):
                 out_of_stock_terms = [
                     "currently unavailable", "out of stock", "temporarily out of stock",
                     "we don’t know when or if this item will be back in stock",
-                    "see all buying options", "unavailable"
+                    "see all buying options", "unavailable",
+                    "this item cannot be dispatched to your selected delivery location"
                 ]
 
                 # Store-specific checks
@@ -350,17 +366,18 @@ async def check_stock(url, store, retries=3):
                     is_low_stock = False
                     reason = "Unknown"
 
+                    # Prioritize buttons as the most reliable indicator
                     if add_to_cart or buy_now:
                         is_in_stock = True
                         reason = "Add to Cart or Buy Now button found"
-                    elif any(term in availability_text for term in in_stock_terms) or \
-                         any(term in delivery_text for term in in_stock_terms):
-                        is_in_stock = True
-                        reason = f"In stock text found: {availability_text[:50]}... (delivery: {delivery_text[:50]}...)"
                     elif any(term in availability_text for term in out_of_stock_terms) or \
                          any(term in delivery_text for term in out_of_stock_terms):
                         is_in_stock = False
                         reason = f"Out of stock text found: {availability_text[:50]}..."
+                    elif any(term in availability_text for term in in_stock_terms) or \
+                         any(term in delivery_text for term in in_stock_terms):
+                        is_in_stock = True
+                        reason = f"In stock text found: {availability_text[:50]}... (delivery: {delivery_text[:50]}...)"
                     else:
                         is_in_stock = False
                         reason = "No stock indicators found"
