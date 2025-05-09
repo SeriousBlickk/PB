@@ -1,14 +1,8 @@
-# Use a lightweight Python base image
-FROM python:3.10-slim
+# Use Playwright base image
+FROM mcr.microsoft.com/playwright:v1.44.0-jammy
 
 # Set working directory
 WORKDIR /app
-
-# Install dependencies
-RUN apt-get update -qq && \
-    apt-get install -y --no-install-recommends && \
-    apt-get clean && \
-    rm -rf /var/lib/apt/lists/*
 
 # Copy project files
 COPY . .
